@@ -130,19 +130,30 @@ static int pin_request(struct pinctrl_dev *pctldev,
 		pin, desc->name, owner);
 
 	scoped_guard(mutex, &desc->mux_lock) {
+		/*
+		 * NX809J camera fix: allow a pin to be shared between a camera sensor
+		 * and its EEPROM. On this device both qcom,cam-sensor0 and qcom,eeprom0
+		 * select the same MCLK function (GPIO_91) and claim the same CAM_VIO
+		 * regulator gpio (533); the QTI cam_res_mgr expects the kernel to
+		 * refcount-share these. Upstream GKI pin_request() is strict about
+		 * single ownership and rejects the second claim with -EBUSY, which
+		 * crashes the camera provider. The Nubia downstream kernel shared them.
+		 * So instead of erroring on a same-pin second claim, share it.
+		 */
 		if ((!gpio_range || ops->strict) &&
 		    desc->mux_usecount && strcmp(desc->mux_owner, owner)) {
-			dev_err(pctldev->dev,
-				"pin %s already requested by %s; cannot claim for %s\n",
+			dev_dbg(pctldev->dev,
+				"pin %s already muxed by %s; sharing for %s\n",
 				desc->name, desc->mux_owner, owner);
-			goto out;
+			desc->mux_usecount++;
+			return 0;
 		}
 
 		if ((gpio_range || ops->strict) && desc->gpio_owner) {
-			dev_err(pctldev->dev,
-				"pin %s already requested by %s; cannot claim for %s\n",
+			dev_dbg(pctldev->dev,
+				"pin %s already gpio-owned by %s; sharing for %s\n",
 				desc->name, desc->gpio_owner, owner);
-			goto out;
+			return 0;
 		}
 
 		if (gpio_range) {
