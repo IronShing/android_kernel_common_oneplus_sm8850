@@ -2313,6 +2313,74 @@ EXPORT_SYMBOL_GPL(gpiochip_remove_pin_ranges);
  * on each other, and help provide better diagnostics in debugfs.
  * They're called even less than the "set direction" calls.
  */
+/*
+ * NX809J camera fix: reference-count gpios shared between camera sub-devices
+ * (e.g. CAM_VIO0, gpio 533, requested by both cam-sensor0 and its eeprom0).
+ * Upstream gpiolib enforces single ownership; the stock Nubia kernel shared
+ * these. Simply returning 0 on the 2nd request (with no tracking) leaks the
+ * request/free balance: whichever sub-device frees first clears FLAG_REQUESTED
+ * while the other still needs it, so under rapid camera open/close the sensor's
+ * regulator gpio ends up in the wrong state and wedges the CCI I2C bus (black
+ * preview). Track a small refcount so the gpio is only really freed once every
+ * camera sub-device that shares it has released it — order-independent.
+ */
+#define CAM_SHARED_GPIO_MAX 16
+static struct {
+	struct gpio_desc *desc;
+	int count;
+} cam_shared_gpio[CAM_SHARED_GPIO_MAX];
+static DEFINE_SPINLOCK(cam_shared_gpio_lock);
+
+/* A 2nd+ requester of an already-requested cam gpio. Returns true if tracked. */
+static bool cam_shared_gpio_get(struct gpio_desc *desc)
+{
+	unsigned long flags;
+	int i, slot = -1;
+	bool ok = false;
+
+	spin_lock_irqsave(&cam_shared_gpio_lock, flags);
+	for (i = 0; i < CAM_SHARED_GPIO_MAX; i++) {
+		if (cam_shared_gpio[i].desc == desc) {
+			cam_shared_gpio[i].count++;
+			ok = true;
+			goto out;
+		}
+		if (!cam_shared_gpio[i].desc && slot < 0)
+			slot = i;
+	}
+	if (slot >= 0) {
+		cam_shared_gpio[slot].desc = desc;
+		cam_shared_gpio[slot].count = 2; /* original owner + this requester */
+		ok = true;
+	}
+out:
+	spin_unlock_irqrestore(&cam_shared_gpio_lock, flags);
+	return ok;
+}
+
+/* Release path. Returns true if the gpio is still shared (do not free yet). */
+static bool cam_shared_gpio_put(struct gpio_desc *desc)
+{
+	unsigned long flags;
+	bool busy = false;
+	int i;
+
+	spin_lock_irqsave(&cam_shared_gpio_lock, flags);
+	for (i = 0; i < CAM_SHARED_GPIO_MAX; i++) {
+		if (cam_shared_gpio[i].desc == desc) {
+			if (--cam_shared_gpio[i].count > 0) {
+				busy = true;
+			} else {
+				cam_shared_gpio[i].desc = NULL;
+				cam_shared_gpio[i].count = 0;
+			}
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&cam_shared_gpio_lock, flags);
+	return busy;
+}
+
 static int gpiod_request_commit(struct gpio_desc *desc, const char *label)
 {
 	unsigned int offset;
@@ -2324,17 +2392,16 @@ static int gpiod_request_commit(struct gpio_desc *desc, const char *label)
 
 	if (test_and_set_bit(FLAG_REQUESTED, &desc->flags)) {
 		/*
-		 * NX809J camera fix: the QTI cam_res_mgr requests the same shared
-		 * regulator/reset gpio (e.g. CAM_VIO0, gpio 533) once per sub-device
-		 * — the main sensor and its EEPROM both request it. Upstream gpiolib
-		 * rejects the 2nd request with -EBUSY, which fails the sensor power-up
-		 * and crashes the camera provider. The stock Nubia kernel shared it.
-		 * The pin is already fully set up by the first requester, so allow a
-		 * 2nd claim for camera gpios (label prefixed "CAM") — narrowly scoped
-		 * so non-camera gpios keep the strict single-owner rule.
+		 * NX809J camera fix: allow a 2nd claim for a camera gpio (label
+		 * prefixed "CAM") that a prior sub-device already requested, and
+		 * reference-count it so the request/free balance is preserved (see
+		 * cam_shared_gpio_get/put above). Non-camera gpios keep the strict
+		 * single-owner rule.
 		 */
-		if (label && !strncmp(label, "CAM", 3))
+		if (label && !strncmp(label, "CAM", 3)) {
+			cam_shared_gpio_get(desc);
 			return 0;
+		}
 		return -EBUSY;
 	}
 
@@ -2422,6 +2489,15 @@ static void gpiod_free_commit(struct gpio_desc *desc)
 	unsigned long flags;
 
 	might_sleep();
+
+	/*
+	 * NX809J camera fix: if this gpio is shared between camera sub-devices,
+	 * only actually release it once the last sharer frees it (see
+	 * cam_shared_gpio_get/put). Prevents the regulator gpio from being torn
+	 * down while another sub-device still holds it.
+	 */
+	if (cam_shared_gpio_put(desc))
+		return;
 
 	CLASS(gpio_chip_guard, guard)(desc);
 
