@@ -2322,8 +2322,21 @@ static int gpiod_request_commit(struct gpio_desc *desc, const char *label)
 	if (!guard.gc)
 		return -ENODEV;
 
-	if (test_and_set_bit(FLAG_REQUESTED, &desc->flags))
+	if (test_and_set_bit(FLAG_REQUESTED, &desc->flags)) {
+		/*
+		 * NX809J camera fix: the QTI cam_res_mgr requests the same shared
+		 * regulator/reset gpio (e.g. CAM_VIO0, gpio 533) once per sub-device
+		 * — the main sensor and its EEPROM both request it. Upstream gpiolib
+		 * rejects the 2nd request with -EBUSY, which fails the sensor power-up
+		 * and crashes the camera provider. The stock Nubia kernel shared it.
+		 * The pin is already fully set up by the first requester, so allow a
+		 * 2nd claim for camera gpios (label prefixed "CAM") — narrowly scoped
+		 * so non-camera gpios keep the strict single-owner rule.
+		 */
+		if (label && !strncmp(label, "CAM", 3))
+			return 0;
 		return -EBUSY;
+	}
 
 	/* NOTE:  gpio_request() can be called in early boot,
 	 * before IRQs are enabled, for non-sleeping (SOC) GPIOs.
