@@ -6,6 +6,7 @@
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/android_kabi.h>
 #include <uapi/linux/io_uring.h>
 
 enum {
@@ -37,6 +38,7 @@ enum io_uring_cmd_flags {
 	/* set when uring wants to cancel a previously issued command */
 	IO_URING_F_CANCEL		= (1 << 11),
 	IO_URING_F_COMPAT		= (1 << 12),
+	IO_URING_F_TASK_DEAD		= (1 << 13),
 };
 
 struct io_wq_work_node {
@@ -328,6 +330,7 @@ struct io_ring_ctx {
 		atomic_t		cq_wait_nr;
 		atomic_t		cq_timeouts;
 		struct wait_queue_head	cq_wait;
+		ANDROID_KABI_IGNORE(8, struct llist_head	retry_llist);
 	} ____cacheline_aligned_in_smp;
 
 	/* timeouts */
@@ -340,7 +343,15 @@ struct io_ring_ctx {
 
 	spinlock_t		completion_lock;
 
+	/*
+	 * ANDROID
+	 * The io_buffers_comp variable was removed in 6.12.81, but needs to remain to keep the ABI
+	 * "stable"
+	 * DO NOT TOUCH OR USE!
+	 * See Bug 512370883 for more details if you are curious.
+	 */
 	struct list_head	io_buffers_comp;
+
 	struct list_head	cq_overflow_list;
 	struct io_hash_table	cancel_table;
 
@@ -360,6 +371,13 @@ struct io_ring_ctx {
 	unsigned int		file_alloc_start;
 	unsigned int		file_alloc_end;
 
+	/*
+	 * ANDROID
+	 * The io_buffers_cache variable was removed in 6.12.81, but needs to remain to keep
+	 * the ABI "stable"
+	 * DO NOT TOUCH OR USE!
+	 * See Bug 512370883 for more details if you are curious.
+	 */
 	struct list_head	io_buffers_cache;
 
 	/* Keep this last, we don't need it for the fast path */
@@ -457,6 +475,7 @@ enum {
 	REQ_F_SKIP_LINK_CQES_BIT,
 	REQ_F_SINGLE_POLL_BIT,
 	REQ_F_DOUBLE_POLL_BIT,
+	REQ_F_MULTISHOT_BIT,
 	REQ_F_APOLL_MULTISHOT_BIT,
 	REQ_F_CLEAR_POLLIN_BIT,
 	REQ_F_HASH_LOCKED_BIT,
@@ -468,6 +487,7 @@ enum {
 	REQ_F_BL_EMPTY_BIT,
 	REQ_F_BL_NO_RECYCLE_BIT,
 	REQ_F_BUFFERS_COMMIT_BIT,
+	REQ_F_BUF_MORE_BIT,
 
 	/* not a real bit, just to check we're not overflowing the space */
 	__REQ_F_LAST_BIT,
@@ -530,6 +550,8 @@ enum {
 	REQ_F_SINGLE_POLL	= IO_REQ_FLAG(REQ_F_SINGLE_POLL_BIT),
 	/* double poll may active */
 	REQ_F_DOUBLE_POLL	= IO_REQ_FLAG(REQ_F_DOUBLE_POLL_BIT),
+	/* request posts multiple completions, should be set at prep time */
+	REQ_F_MULTISHOT		= IO_REQ_FLAG(REQ_F_MULTISHOT_BIT),
 	/* fast poll multishot mode */
 	REQ_F_APOLL_MULTISHOT	= IO_REQ_FLAG(REQ_F_APOLL_MULTISHOT_BIT),
 	/* recvmsg special flag, clear EPOLLIN */
@@ -546,6 +568,8 @@ enum {
 	REQ_F_BL_NO_RECYCLE	= IO_REQ_FLAG(REQ_F_BL_NO_RECYCLE_BIT),
 	/* buffer ring head needs incrementing on put */
 	REQ_F_BUFFERS_COMMIT	= IO_REQ_FLAG(REQ_F_BUFFERS_COMMIT_BIT),
+	/* incremental buffer consumption, more space available */
+	REQ_F_BUF_MORE		= IO_REQ_FLAG(REQ_F_BUF_MORE_BIT),
 };
 
 typedef void (*io_req_tw_func_t)(struct io_kiocb *req, struct io_tw_state *ts);
@@ -625,10 +649,13 @@ struct io_kiocb {
 		struct io_buffer	*kbuf;
 
 		/*
-		 * stores buffer ID for ring provided buffers, valid IFF
-		 * REQ_F_BUFFER_RING is set.
+		 * ANDROID
+		 * This buf_list variable was removed in 6.12.81, but needs to remain to keep
+		 * gendwarfsyms from crashing.
+		 * DO NOT TOUCH OR USE!
+		 * See Bug 512370883 for more details if you are curious.
 		 */
-		struct io_buffer_list	*buf_list;
+		struct io_buffer_list   *buf_list;
 	};
 
 	union {
@@ -643,8 +670,16 @@ struct io_kiocb {
 	atomic_t			refs;
 	bool				cancel_seq_set;
 	struct io_task_work		io_task_work;
-	/* for polled requests, i.e. IORING_OP_POLL_ADD and async armed poll */
-	struct hlist_node		hash_node;
+	union {
+		/*
+		 * for polled requests, i.e. IORING_OP_POLL_ADD and async armed
+		 * poll
+		 */
+		struct hlist_node	hash_node;
+
+		/* for private io_kiocb freeing */
+		struct rcu_head		rcu_head;
+	};
 	/* internal polling, see IORING_FEAT_FAST_POLL */
 	struct async_poll		*apoll;
 	/* opcode allocated if it needs to store data for async defer */
@@ -661,6 +696,8 @@ struct io_kiocb {
 		u64			extra2;
 	} big_cqe;
 };
+
+ANDROID_KABI_TYPE_STRING("s#io_kiocb", "structure_type io_kiocb { member union_type { member pointer_type { s#file } file data_member_location(0) , member s#io_cmd_data cmd data_member_location(0) } byte_size(64) data_member_location(0) , member t#u8 opcode data_member_location(64) , member t#u8 iopoll_completed data_member_location(65) , member t#u16 buf_index data_member_location(66) , member base_type unsigned int byte_size(4) encoding(7) nr_tw data_member_location(68) , member t#io_req_flags_t flags data_member_location(72) , member s#io_cqe cqe data_member_location(80) , member pointer_type { s#io_ring_ctx } ctx data_member_location(96) , member pointer_type { s#task_struct } task data_member_location(104) , member union_type { member pointer_type { s#io_mapped_ubuf } imu data_member_location(0) , member pointer_type { s#io_buffer } kbuf data_member_location(0) , member pointer_type { s#io_buffer_list } buf_list data_member_location(0) } byte_size(8) data_member_location(112) , member union_type { member s#io_wq_work_node comp_list data_member_location(0) , member t#__poll_t apoll_events data_member_location(0) } byte_size(8) data_member_location(120) , member pointer_type { s#io_rsrc_node } rsrc_node data_member_location(128) , member t#atomic_t refs data_member_location(136) , member t#bool cancel_seq_set data_member_location(140) , member s#io_task_work io_task_work data_member_location(144) , member s#hlist_node hash_node data_member_location(160) , member pointer_type { s#async_poll } apoll data_member_location(176) , member pointer_type { base_type void } async_data data_member_location(184) , member t#atomic_t poll_refs data_member_location(192) , member pointer_type { s#io_kiocb } link data_member_location(200) , member pointer_type { const_type { s#cred } } creds data_member_location(208) , member s#io_wq_work work data_member_location(216) , member structure_type { member t#u64 extra1 data_member_location(0) , member t#u64 extra2 data_member_location(8) } byte_size(16) big_cqe data_member_location(232) } byte_size(248)");
 
 struct io_overflow_cqe {
 	struct list_head list;

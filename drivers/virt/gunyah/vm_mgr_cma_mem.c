@@ -8,6 +8,7 @@
 #include <linux/cma.h>
 #include <linux/file.h>
 #include <linux/miscdevice.h>
+#include <linux/mutex.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 
@@ -15,11 +16,13 @@
 
 struct gunyah_cma {
 	struct device dev;
-	struct file *file;
+	struct mutex lock;
+	bool fd_active;
 	struct page *page;
 	struct miscdevice miscdev;
 	struct list_head list;
-	unsigned long size;
+	unsigned long max_size;
+	unsigned long mapped_size;
 };
 
 struct gunyah_cma_parent {
@@ -35,16 +38,17 @@ struct gunyah_cma_parent {
  *
  * Return: The 0 on success or an error.
  */
-static int gunyah_cma_alloc(struct gunyah_cma *cma, loff_t len)
+static int gunyah_cma_alloc(struct gunyah_cma *cma, struct file *file, loff_t len)
 {
 	pgoff_t pagecount = len >> PAGE_SHIFT;
 	unsigned long align = get_order(len);
 	loff_t max_size;
 
+	guard(mutex)(&cma->lock);
 	if (cma->page)
 		return -EINVAL;
 
-	max_size = i_size_read(file_inode(cma->file));
+	max_size = i_size_read(file_inode(file));
 	if (len > max_size)
 		return -EINVAL;
 
@@ -55,20 +59,29 @@ static int gunyah_cma_alloc(struct gunyah_cma *cma, loff_t len)
 	if (!cma->page)
 		return -ENOMEM;
 
+	if (len < max_size)
+		dev_dbg(&cma->dev, "client mapped %lld bytes, less than max %lld bytes\n",
+			len, max_size);
+
+	cma->mapped_size = len;
+
 	return 0;
 }
 
 static int gunyah_cma_release(struct inode *inode, struct file *file)
 {
 	struct gunyah_cma *cma = file->private_data;
-	loff_t max_size = i_size_read(file_inode(cma->file));
-	unsigned int count = PAGE_ALIGN(max_size) >> PAGE_SHIFT;
+	unsigned int count;
 
+	guard(mutex)(&cma->lock);
+	cma->fd_active = false;
 	if (!cma->page)
 		return 0;
 
+	count = PAGE_ALIGN(cma->mapped_size) >> PAGE_SHIFT;
 	cma_release(cma->dev.cma_area, cma->page, count);
 	cma->page = NULL;
+	cma->mapped_size = 0;
 
 	return 0;
 }
@@ -87,7 +100,7 @@ static int gunyah_cma_mmap(struct file *file, struct vm_area_struct *vma)
 	if (!pages)
 		return -ENOMEM;
 
-	ret = gunyah_cma_alloc(cma, len);
+	ret = gunyah_cma_alloc(cma, file, len);
 	if (ret < 0) {
 		kvfree(pages);
 		return ret;
@@ -137,7 +150,6 @@ int gunyah_cma_reclaim_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *v
 	vm_parcel->start = 0;
 	vm_parcel->pages = 0;
 	b->vm_parcel = NULL;
-	fput(b->cma.file);
 	return ret;
 }
 
@@ -145,38 +157,31 @@ int gunyah_cma_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_
 				struct gunyah_vm_binding *b, u64 *gfn, u64 *nr)
 {
 	struct gunyah_rm_mem_parcel *parcel = &vm_parcel->parcel;
-	unsigned long offset;
+	u64 offset, page_offset;
 	struct gunyah_cma *cma;
-	struct file *file;
 	int ret;
 
 	if ((*nr << PAGE_SHIFT) > b->size)
 		return -EINVAL;
 
-	file = fget(b->cma.fd);
-	if (!file)
+	cma = b->cma.file->private_data;
+	if (!cma->page)
 		return -EINVAL;
 
-	if (file->f_op != &gunyah_cma_fops) {
-		fput(file);
+	offset = gunyah_gfn_to_gpa(*gfn) - b->guest_phys_addr;
+	page_offset = (b->cma.offset + offset) >> PAGE_SHIFT;
+	if (page_offset + *nr > (cma->mapped_size >> PAGE_SHIFT))
 		return -EINVAL;
-	}
-
-	cma = file->private_data;
-	b->cma.file = file;
 
 	parcel->n_mem_entries = 1;
 	parcel->mem_entries = kcalloc(parcel->n_mem_entries, sizeof(parcel->mem_entries[0]),
 					GFP_KERNEL_ACCOUNT);
-	if (!parcel->mem_entries) {
-		fput(file);
+	if (!parcel->mem_entries)
 		return -ENOMEM;
-	}
 
-	offset = gunyah_gfn_to_gpa(*gfn) - b->guest_phys_addr;
 	parcel->mem_entries[0].size = cpu_to_le64(*nr << PAGE_SHIFT);
 	parcel->mem_entries[0].phys_addr =
-		cpu_to_le64(page_to_phys(cma->page + b->cma.offset + offset));
+		cpu_to_le64(page_to_phys(nth_page(cma->page, page_offset)));
 
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
 	if (ret)
@@ -191,7 +196,6 @@ free_mem_entries:
 	kfree(parcel->mem_entries);
 	parcel->mem_entries = NULL;
 	parcel->n_mem_entries = 0;
-	fput(file);
 	return ret;
 }
 
@@ -200,6 +204,7 @@ int gunyah_vm_binding_cma_alloc(struct gunyah_vm *ghvm,
 {
 	struct gunyah_vm_binding *binding;
 	struct file *file;
+	u64 end;
 	loff_t max_size;
 	int ret = 0;
 
@@ -210,20 +215,35 @@ int gunyah_vm_binding_cma_alloc(struct gunyah_vm *ghvm,
 	if (overflows_type(cma_map->guest_addr + cma_map->size, u64))
 		return -EOVERFLOW;
 
+	/*
+	 * The file reference is held for the lifetime of the binding.
+	 * The corresponding fput() is done in _gunyah_vm_put() when
+	 * the binding is freed.
+	 */
 	file = fget(cma_map->guest_mem_fd);
+	if (!file)
+		return -EBADF;
+
+	if (file->f_op != &gunyah_cma_fops) {
+		fput(file);
+		return -EINVAL;
+	}
+
 	max_size = i_size_read(file_inode(file));
-	if (cma_map->offset + cma_map->size > max_size) {
+	if (check_add_overflow(cma_map->offset, cma_map->size, &end) ||
+	    end > max_size) {
 		fput(file);
 		return -EOVERFLOW;
 	}
-	fput(file);
 
 	binding = kzalloc(sizeof(*binding), GFP_KERNEL_ACCOUNT);
-	if (!binding)
+	if (!binding) {
+		fput(file);
 		return -ENOMEM;
+	}
 
 	binding->mem_type = VM_MEM_CMA;
-	binding->cma.fd = cma_map->guest_mem_fd;
+	binding->cma.file = file;
 	binding->cma.offset = cma_map->offset;
 	binding->guest_phys_addr = cma_map->guest_addr;
 	binding->label = cma_map->label;
@@ -242,8 +262,10 @@ int gunyah_vm_binding_cma_alloc(struct gunyah_vm *ghvm,
 				 gunyah_gpa_to_gfn(binding->guest_phys_addr + cma_map->size - 1),
 				 binding, GFP_KERNEL);
 
-	if (ret != 0)
+	if (ret != 0) {
+		fput(file);
 		kfree(binding);
+	}
 
 	up_write(&ghvm->bindings_lock);
 
@@ -257,7 +279,15 @@ static long gunyah_cma_create_mem_fd(struct gunyah_cma *cma)
 	struct file *file;
 	int fd, err;
 
-	if (cma->page)
+	guard(mutex)(&cma->lock);
+	/*
+	 * Allow only one anon fd at a time. Each open creates a new struct
+	 * file with private_data pointing to the same singleton struct
+	 * gunyah_cma. A second fd could call cma_release() and free the CMA
+	 * pages that were allocated by the first fd's mmap(), leaving the
+	 * first fd's VMA mapping freed memory.
+	 */
+	if (cma->fd_active)
 		return -EBUSY;
 
 	flags |= O_CLOEXEC;
@@ -275,15 +305,16 @@ static long gunyah_cma_create_mem_fd(struct gunyah_cma *cma)
 	inode = file->f_inode;
 	inode->i_mode |= S_IFREG;
 	/* Platform specific size of CMA per VM */
-	i_size_write(inode, cma->size);
+	i_size_write(inode, cma->max_size);
 
 	file->f_flags |= O_LARGEFILE;
 	file->f_mapping = inode->i_mapping;
-	cma->file = file;
 	fd_install(fd, file);
+	cma->fd_active = true;
 
 	return fd;
 err_put_fd:
+	cma->fd_active = false;
 	put_unused_fd(fd);
 	return err;
 }
@@ -361,6 +392,7 @@ static int gunyah_cma_probe(struct platform_device *pdev)
 			goto err_continue;
 		}
 
+		mutex_init(&cma->lock);
 		cma->miscdev.parent = &pdev->dev;
 		cma->miscdev.name = mem_name[i];
 		cma->miscdev.minor = MISC_DYNAMIC_MINOR;
@@ -390,7 +422,7 @@ static int gunyah_cma_probe(struct platform_device *pdev)
 			dev_err(dev, "Failed to find reserved memory for %s\n", mem_name[i]);
 			goto err_device;
 		}
-		cma->size = rmem->size;
+		cma->max_size = rmem->size;
 		cma->page = NULL;
 		list_add(&cma->list, &pcma->gunyah_cma_children);
 		dev_dbg(dev, "Created a reserved cma pool for %s\n", mem_name[i]);

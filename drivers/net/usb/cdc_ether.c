@@ -17,46 +17,54 @@
 #include <linux/usb.h>
 #include <linux/usb/cdc.h>
 #include <linux/usb/usbnet.h>
+#include <trace/hooks/cdc_ether.h>
 
+#include <linux/android_kabi.h>
+ANDROID_KABI_DECLONLY(trace_eval_map);
 
+static bool is_config_rndis_enabled(void)
+{
 #if IS_ENABLED(CONFIG_USB_NET_RNDIS_HOST)
+	return true;
+#else
+	bool enable = false;
+
+	trace_android_vh_is_rndis_enabled(&enable);
+	return enable;
+#endif
+}
 
 static int is_rndis(struct usb_interface_descriptor *desc)
 {
-	return (desc->bInterfaceClass == USB_CLASS_COMM &&
+	return (is_config_rndis_enabled()) ?
+		(desc->bInterfaceClass == USB_CLASS_COMM &&
 		desc->bInterfaceSubClass == 2 &&
-		desc->bInterfaceProtocol == 0xff);
+		desc->bInterfaceProtocol == 0xff) : 0;
 }
 
 static int is_activesync(struct usb_interface_descriptor *desc)
 {
-	return (desc->bInterfaceClass == USB_CLASS_MISC &&
+	return (is_config_rndis_enabled()) ?
+		(desc->bInterfaceClass == USB_CLASS_MISC &&
 		desc->bInterfaceSubClass == 1 &&
-		desc->bInterfaceProtocol == 1);
+		desc->bInterfaceProtocol == 1) : 0;
 }
 
 static int is_wireless_rndis(struct usb_interface_descriptor *desc)
 {
-	return (desc->bInterfaceClass == USB_CLASS_WIRELESS_CONTROLLER &&
+	return (is_config_rndis_enabled()) ?
+		(desc->bInterfaceClass == USB_CLASS_WIRELESS_CONTROLLER &&
 		desc->bInterfaceSubClass == 1 &&
-		desc->bInterfaceProtocol == 3);
+		desc->bInterfaceProtocol == 3) : 0;
 }
 
 static int is_novatel_rndis(struct usb_interface_descriptor *desc)
 {
-	return (desc->bInterfaceClass == USB_CLASS_MISC &&
+	return (is_config_rndis_enabled()) ?
+		(desc->bInterfaceClass == USB_CLASS_MISC &&
 		desc->bInterfaceSubClass == 4 &&
-		desc->bInterfaceProtocol == 1);
+		desc->bInterfaceProtocol == 1) : 0;
 }
-
-#else
-
-#define is_rndis(desc)		0
-#define is_activesync(desc)	0
-#define is_wireless_rndis(desc)	0
-#define is_novatel_rndis(desc)	0
-
-#endif
 
 static const u8 mbm_guid[16] = {
 	0xa3, 0x17, 0xa8, 0x8b, 0x04, 0x5e, 0x4f, 0x01,
@@ -779,6 +787,13 @@ static const struct usb_device_id	products[] = {
 /* Lenovo Powered USB-C Travel Hub (4X90S92381, based on Realtek RTL8153) */
 {
 	USB_DEVICE_AND_INTERFACE_INFO(LENOVO_VENDOR_ID, 0x721e, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_ETHERNET, USB_CDC_PROTO_NONE),
+	.driver_info = 0,
+},
+
+/* Lenovo ThinkPad Hybrid USB-C with USB-A Dock (40af0135eu, based on Realtek RTL8153) */
+{
+	USB_DEVICE_AND_INTERFACE_INFO(LENOVO_VENDOR_ID, 0xa359, USB_CLASS_COMM,
 			USB_CDC_SUBCLASS_ETHERNET, USB_CDC_PROTO_NONE),
 	.driver_info = 0,
 },

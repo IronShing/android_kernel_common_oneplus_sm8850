@@ -516,6 +516,7 @@ restart:
 					pte_offset_map_lock(mm, pmd, addr, &ptl);
 				if (!start_pte)
 					break;
+				flush_tlb_batched_pending(mm);
 				arch_enter_lazy_mmu_mode();
 				if (!err)
 					nr = 0;
@@ -765,6 +766,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 				start_pte = pte;
 				if (!start_pte)
 					break;
+				flush_tlb_batched_pending(mm);
 				arch_enter_lazy_mmu_mode();
 				if (!err)
 					nr = 0;
@@ -880,9 +882,14 @@ static int madvise_free_single_vma(struct vm_area_struct *vma,
 static long madvise_dontneed_single_vma(struct vm_area_struct *vma,
 					unsigned long start, unsigned long end)
 {
+	struct zap_details details = {
+		.zap_flags = ZAP_FLAG_RECLAIM_PT,
+		.even_cows = true,
+	};
+
 	madvise_vma_pad_pages(vma, start, end);
 
-	zap_page_range_single(vma, start, end - start, NULL);
+	zap_page_range_single(vma, start, end - start, &details);
 	return 0;
 }
 

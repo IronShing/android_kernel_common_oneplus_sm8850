@@ -10,10 +10,10 @@ use kernel::{
     ffi::{c_int, c_ulong},
     fs::file::{File, LocalFile},
     miscdevice::{loff_t, IovIter},
-    mm::virt::{vm_flags_t, VmAreaNew},
+    mm::virt::{vm_flags_t, VmaNew},
     prelude::*,
     str::CStr,
-    types::ARef,
+    types::{ARef, Opaque},
 };
 
 use core::{
@@ -37,8 +37,8 @@ pub(crate) unsafe fn file_set_fpos(file: &LocalFile, pos: loff_t) {
     unsafe { (*file.as_ptr()).f_pos = pos };
 }
 
-pub(crate) fn vma_set_anonymous(vma: &VmAreaNew) {
-    // SAFETY: The `VmAreaNew` type is only used when the vma is being set up, so this operation is
+pub(crate) fn vma_set_anonymous(vma: &VmaNew) {
+    // SAFETY: The `VmaNew` type is only used when the vma is being set up, so this operation is
     // safe.
     unsafe { (*vma.as_ptr()).vm_ops = core::ptr::null_mut() };
 }
@@ -152,13 +152,13 @@ fn set_inode_lockdep_class(vmfile: &File) {
     }
 }
 
-pub(crate) fn zero_setup(vma: &VmAreaNew) -> Result<()> {
-    // SAFETY: The `VmAreaNew` type is only used when the vma is being set up, so we can set up the
+pub(crate) fn zero_setup(vma: &VmaNew) -> Result<()> {
+    // SAFETY: The `VmaNew` type is only used when the vma is being set up, so we can set up the
     // vma.
     to_result(unsafe { bindings::shmem_zero_setup(vma.as_ptr()) })
 }
 
-pub(crate) fn set_file(vma: &VmAreaNew, file: &File) {
+pub(crate) fn set_file(vma: &VmaNew, file: &File) {
     let file = ARef::from(file);
     // SAFETY: We're setting up the vma, so we can read the file pointer.
     let old_file = unsafe { (*vma.as_ptr()).vm_file };
@@ -238,4 +238,48 @@ unsafe extern "C" fn ashmem_vmfile_get_unmapped_area(
     let mm = unsafe { (*bindings::get_current()).mm };
     // SAFETY: This calls the right get_unmapped_area for a shmem.
     unsafe { bindings::mm_get_unmapped_area(mm, file, addr, len, pgoff, flags) }
+}
+
+#[pin_data(PinnedDrop)]
+pub(crate) struct DentryNameSnapshot {
+    #[pin]
+    snapshot: Opaque<bindings::name_snapshot>,
+}
+
+impl DentryNameSnapshot {
+    pub(crate) fn new(file: &File) -> impl PinInit<Self, core::convert::Infallible> + '_ {
+        pin_init!(Self {
+            snapshot <- Opaque::ffi_init(move |ptr| {
+                let file_ptr = file.as_ptr();
+                // SAFETY: It's safe to access a file's dentry.
+                let dentry = unsafe { (*file_ptr).f_path.dentry };
+                // SAFETY: ptr is valid for writing. dentry is valid by safety requirements.
+                unsafe { bindings::take_dentry_name_snapshot(ptr, dentry) };
+            }),
+        })
+    }
+}
+
+impl core::ops::Deref for DentryNameSnapshot {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        let snapshot_ptr = self.snapshot.get();
+        // SAFETY: The snapshot is initialized and valid.
+        unsafe {
+            core::slice::from_raw_parts(
+                (*snapshot_ptr).name.name,
+                (*snapshot_ptr).name.__bindgen_anon_1.__bindgen_anon_1.len as usize,
+            )
+        }
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for DentryNameSnapshot {
+    fn drop(self: Pin<&mut Self>) {
+        let snapshot_ptr = self.snapshot.get();
+        // SAFETY: This snapshot is valid.
+        unsafe { bindings::release_dentry_name_snapshot(snapshot_ptr) };
+    }
 }
