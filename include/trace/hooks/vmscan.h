@@ -24,6 +24,12 @@ DECLARE_HOOK(android_vh_check_folio_look_around_ref,
 DECLARE_HOOK(android_vh_tune_swappiness,
 	TP_PROTO(int *swappiness),
 	TP_ARGS(swappiness));
+DECLARE_HOOK(android_vh_tune_inactive_ratio,
+	TP_PROTO(unsigned long *inactive_ratio, int file),
+	TP_ARGS(inactive_ratio, file));
+DECLARE_HOOK(android_vh_mem_cgroup_flush_stats_bypass,
+	TP_PROTO(struct mem_cgroup *target_mem_cgroup, bool *bypass),
+	TP_ARGS(target_mem_cgroup, bypass));
 DECLARE_HOOK(android_vh_shrink_folio_list,
 	TP_PROTO(struct folio *folio, bool dirty, bool writeback,
 		bool *activate, bool *keep),
@@ -121,12 +127,12 @@ DECLARE_HOOK(android_vh_direct_reclaim_end,
 DECLARE_HOOK(android_vh_throttle_direct_reclaim_bypass,
 	TP_PROTO(bool *bypass),
 	TP_ARGS(bypass));
-DECLARE_HOOK(android_vh_shrink_node_memcgs,
-	TP_PROTO(struct mem_cgroup *memcg, bool *skip),
-	TP_ARGS(memcg, skip));
 DECLARE_HOOK(android_vh_shrink_node,
 	TP_PROTO(pg_data_t *pgdat, struct mem_cgroup *memcg),
 	TP_ARGS(pgdat, memcg));
+DECLARE_HOOK(android_vh_shrink_node_memcgs,
+	TP_PROTO(struct mem_cgroup *memcg, bool *skip),
+	TP_ARGS(memcg, skip));
 DECLARE_HOOK(android_vh_mm_isolate_priv_lru,
 	TP_PROTO(unsigned long nr_to_scan, struct lruvec *lruvec, enum lru_list lru,
 		struct list_head *dst, int reclaim_idx, bool may_unmap,

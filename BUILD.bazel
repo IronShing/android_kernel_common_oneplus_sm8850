@@ -92,7 +92,7 @@ fail_rule(
 
 write_file(
     name = "gki_system_dlkm_modules_arm64",
-    out = "android/gki_system_dlkm_modules_arm64",
+    out = "gki/aarch64/system_dlkm_modules",
     # Do not built kunit modules into system_dlkm
     content = get_gki_modules_list("arm64") + [
         # Ensure new line at the end.
@@ -113,7 +113,7 @@ write_file(
 
 write_file(
     name = "gki_system_dlkm_modules_x86_64",
-    out = "android/gki_system_dlkm_modules_x86_64",
+    out = "gki/x86_64/system_dlkm_modules",
     # Do not built kunit modules into system_dlkm
     content = get_gki_modules_list("x86_64") + [
         # Ensure new line at the end.
@@ -169,6 +169,9 @@ filegroup(
             # cscope files
             "cscope.*",
             "ncscope.*",
+
+            # ABI and symbol list files
+            "gki/**",
         ],
     ),
     visibility = ["//visibility:public"],
@@ -180,6 +183,7 @@ filegroup(
         # keep sorted
         "gki/aarch64/symbols/allwinner",
         "gki/aarch64/symbols/amlogic",
+        "gki/aarch64/symbols/asr",
         "gki/aarch64/symbols/bcmstb",
         "gki/aarch64/symbols/db845c",
         "gki/aarch64/symbols/desktop",
@@ -189,14 +193,19 @@ filegroup(
         "gki/aarch64/symbols/galaxy",
         "gki/aarch64/symbols/honor",
         "gki/aarch64/symbols/imx",
+        "gki/aarch64/symbols/lenovo",
+        "gki/aarch64/symbols/meizu",
         "gki/aarch64/symbols/mtk",
         "gki/aarch64/symbols/mtktv",
         "gki/aarch64/symbols/oplus",
         "gki/aarch64/symbols/pixel",
+        "gki/aarch64/symbols/pixel_watch",
         "gki/aarch64/symbols/qcom",
+        "gki/aarch64/symbols/rockchip",
         "gki/aarch64/symbols/rtkstb",
         "gki/aarch64/symbols/rtktv",
         "gki/aarch64/symbols/tcl",
+        "gki/aarch64/symbols/transsion",
         "gki/aarch64/symbols/trusty",
         "gki/aarch64/symbols/tuxera",
         "gki/aarch64/symbols/type_visibility",
@@ -204,6 +213,7 @@ filegroup(
         "gki/aarch64/symbols/virtual_device",
         "gki/aarch64/symbols/vivo",
         "gki/aarch64/symbols/xiaomi",
+        "gki/aarch64/symbols/zte",
     ],
     visibility = ["//visibility:public"],
 )
@@ -247,7 +257,7 @@ common_kernel(
         ":tests_zip_arm64",
     ],
     gki_boot_img_sizes = _GKI_AARCH64_BOOT_IMAGE_SIZES,
-    gki_system_dlkm_modules = "android/gki_system_dlkm_modules_arm64",
+    gki_system_dlkm_modules = ":gki_system_dlkm_modules_arm64",
     kcflags = COMMON_KCFLAGS,
     kmi_enforced = True,
     kmi_symbol_list = "gki/aarch64/symbols/base",
@@ -275,7 +285,7 @@ common_kernel(
         ":tests_zip_arm64",
     ],
     gki_boot_img_sizes = _GKI_AARCH64_BOOT_IMAGE_SIZES,
-    gki_system_dlkm_modules = "android/gki_system_dlkm_modules_arm64",
+    gki_system_dlkm_modules = ":gki_system_dlkm_modules_arm64",
     kcflags = COMMON_KCFLAGS,
     # We don't guarantee ABI stability for 16k target
     kmi_enforced = False,
@@ -379,7 +389,7 @@ common_kernel(
         ":tests_zip_x86_64",
     ],
     gki_boot_img_sizes = _GKI_X86_64_BOOT_IMAGE_SIZES,
-    gki_system_dlkm_modules = "android/gki_system_dlkm_modules_x86_64",
+    gki_system_dlkm_modules = ":gki_system_dlkm_modules_x86_64",
     kcflags = COMMON_KCFLAGS,
     make_goals = _GKI_X86_64_MAKE_GOALS,
     makefile = ":Makefile",
@@ -1616,11 +1626,15 @@ ddk_headers(
     hdrs = [
         "arch/arm64/kvm/hyp/include/module/nvhe/define_events.h",
         "arch/arm64/kvm/hyp/include/module/nvhe/trace.h",
+        "arch/arm64/kvm/hyp/include/nvhe/iommu.h",
+        "arch/arm64/kvm/hyp/include/nvhe/spinlock.h",
+        "arch/arm64/kvm/hyp/include/nvhe/trap_handler.h",
     ],
     includes = [
         # LINT.IfChange(pkvm_includes)
         "arch/arm64/kvm/hyp/include/module",
         # LINT.ThenChange(/arch/arm64/kvm/hyp/nvhe/Makefile.module:includes)
+        "arch/arm64/kvm/hyp/include",
     ],
     visibility = ["//visibility:private"],
 )
@@ -1650,6 +1664,7 @@ ddk_headers(
 ddk_headers(
     name = "all_headers_allowlist_aarch64",
     hdrs = [
+        "drivers/dma/dmaengine.h",
         "drivers/extcon/extcon.h",
         "drivers/pci/controller/dwc/pcie-designware.h",
         "drivers/pci/pci.h",
@@ -1675,6 +1690,7 @@ ddk_headers(
     linux_includes = [
         "arch/arm64/include",
         "arch/arm64/include/uapi",
+        "drivers/dma",
         "drivers/extcon",
         "drivers/pci",
         "drivers/pci/controller/dwc",

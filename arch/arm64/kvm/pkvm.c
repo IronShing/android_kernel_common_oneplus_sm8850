@@ -4,6 +4,8 @@
  * Author: Quentin Perret <qperret@google.com>
  */
 
+#include <linux/arm_ffa.h>
+#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/initrd.h>
 #include <linux/interval_tree_generic.h>
@@ -38,6 +40,15 @@
 #include "hyp_trace.h"
 
 #define PKVM_DEVICE_ASSIGN_COMPAT	"pkvm,device-assignment"
+
+/*
+ * Retry the VM creation message for the host for a maximul total
+ * amount of times, with sleeps in between. For the first few attempts,
+ * do a faster reschedule instead of a full sleep.
+ */
+#define VM_AVAILABILITY_FAST_RETRIES	5
+#define VM_AVAILABILITY_TOTAL_RETRIES	500
+#define VM_AVAILABILITY_RETRY_SLEEP_MS	10
 
 DEFINE_STATIC_KEY_FALSE(kvm_protected_mode_initialized);
 
@@ -74,12 +85,33 @@ static void __init sort_memblock_regions(void)
 static int __init register_memblock_regions(void)
 {
 	struct memblock_region *reg;
+	bool pvmfw_in_mem = false;
 
 	for_each_mem_region(reg) {
 		if (*hyp_memblock_nr_ptr >= HYP_MEMBLOCK_REGIONS)
 			return -ENOMEM;
 
 		hyp_memory[*hyp_memblock_nr_ptr] = *reg;
+		(*hyp_memblock_nr_ptr)++;
+
+		if (!pvmfw_size || pvmfw_in_mem ||
+			!memblock_addrs_overlap(reg->base, reg->size, pvmfw_base, pvmfw_size))
+			continue;
+		/* If the pvmfw region overlaps a memblock, it must be a subset */
+		if (pvmfw_base < reg->base || (pvmfw_base + pvmfw_size) > (reg->base + reg->size))
+			return -EINVAL;
+		pvmfw_in_mem = true;
+	}
+
+	if (pvmfw_size && !pvmfw_in_mem) {
+		if (*hyp_memblock_nr_ptr >= HYP_MEMBLOCK_REGIONS)
+			return -ENOMEM;
+
+		hyp_memory[*hyp_memblock_nr_ptr] = (struct memblock_region) {
+			.base   = pvmfw_base,
+			.size   = pvmfw_size,
+			.flags  = MEMBLOCK_NOMAP,
+		};
 		(*hyp_memblock_nr_ptr)++;
 	}
 	sort_memblock_regions();
@@ -194,6 +226,8 @@ static int __init early_hyp_lm_size_mb_cfg(char *arg)
 }
 early_param("kvm-arm.hyp_lm_size_mb", early_hyp_lm_size_mb_cfg);
 
+DEFINE_STATIC_KEY_FALSE(kvm_ffa_unmap_on_lend);
+
 void __init kvm_hyp_reserve(void)
 {
 	u64 hyp_mem_pages = 0;
@@ -225,6 +259,10 @@ void __init kvm_hyp_reserve(void)
 	hyp_mem_pages += hyp_vmemmap_pages(STRUCT_HYP_PAGE_SIZE);
 	hyp_mem_pages += pkvm_selftest_pages();
 	hyp_mem_pages += hyp_ffa_proxy_pages();
+
+	if (static_branch_unlikely(&kvm_ffa_unmap_on_lend))
+		hyp_mem_pages += KVM_FFA_SPM_HANDLE_NR_PAGES;
+
 	hyp_mem_pages++; /* hyp_ppages */
 
 	/*
@@ -289,27 +327,21 @@ err_free_reqs:
 }
 
 /*
- * Handle broken down huge pages which have not been reported to the
- * kvm_pinned_page.
+ * Handle split huge pages which have not been reported to the kvm_pinned_page tree.
  */
-int pkvm_call_hyp_nvhe_ppage(struct kvm_pinned_page *ppage,
-			     int (*call_hyp_nvhe)(u64 pfn, u64 gfn, u8 order, void* args),
-			     void *args, bool unmap)
+static int pkvm_call_hyp_nvhe_ppage(struct kvm_pinned_page *ppage,
+				    int (*call_hyp_nvhe)(u64 pfn, u64 gfn, u8 order, void *args),
+				    void *args)
 {
 	size_t page_size, size = PAGE_SIZE << ppage->order;
 	u64 pfn = page_to_pfn(ppage->page);
 	u8 order = ppage->order;
 	u64 gfn = ppage->ipa >> PAGE_SHIFT;
 
-	/* We already know this huge-page has been broken down in the stage-2 */
-	if (ppage->pins < (1 << order))
-		order = 0;
-
 	while (size) {
 		int err = call_hyp_nvhe(pfn, gfn, order, args);
 
 		switch (err) {
-		/* The stage-2 huge page has been broken down */
 		case -E2BIG:
 			if (order)
 				order = 0;
@@ -317,16 +349,6 @@ int pkvm_call_hyp_nvhe_ppage(struct kvm_pinned_page *ppage,
 				/* Something is really wrong ... */
 				return -EINVAL;
 			break;
-		/* This has been unmapped already */
-		case -ENOENT:
-			/*
-			 * We are not supposed to lose track of PAGE_SIZE pinned
-			 * page.
-			 */
-			if (!ppage->order)
-				return -EINVAL;
-
-			fallthrough;
 		case 0:
 			page_size = PAGE_SIZE << order;
 			gfn += 1 << order;
@@ -334,13 +356,6 @@ int pkvm_call_hyp_nvhe_ppage(struct kvm_pinned_page *ppage,
 
 			if (page_size > size)
 				return -EINVAL;
-
-			/* If -ENOENT, the pin was already dropped. */
-			if (unmap && !err)
-				ppage->pins -= 1 << order;
-
-			if (!ppage->pins)
-				return 0;
 
 			size -= page_size;
 			break;
@@ -361,6 +376,52 @@ static int __reclaim_dying_guest_page_call(u64 pfn, u64 gfn, u8 order, void *arg
 				 pfn, gfn, order);
 }
 
+/* __pkvm_notify_guest_vm_avail_retry - notify secure of the VM state change
+ * @host_kvm: the kvm structure
+ * @availability_msg: the VM state that will be notified
+ *
+ * Returns: 0 when the notification is sent with success, -EINTR or -EAGAIN if
+ * the destruction notification is interrupted and retries exceeded and
+ * a positive value indicating the remaining jiffies when the creation
+ * notification is sent but interrupted.
+ */
+static int __pkvm_notify_guest_vm_avail_retry(struct kvm *host_kvm, u32 availability_msg)
+{
+	int ret, retries;
+	long timeout;
+
+	if (!host_kvm->arch.pkvm.ffa_support)
+		return 0;
+
+	for (retries = 0; retries < VM_AVAILABILITY_TOTAL_RETRIES; retries++) {
+		ret = kvm_call_hyp_nvhe(__pkvm_notify_guest_vm_avail,
+					host_kvm->arch.pkvm.handle);
+		if (!ret)
+			return 0;
+		else if (ret != -EINTR && ret != -EAGAIN)
+			return ret;
+
+		if (retries < VM_AVAILABILITY_FAST_RETRIES) {
+			cond_resched();
+		} else if (availability_msg == FFA_VM_DESTRUCTION_MSG) {
+			msleep(VM_AVAILABILITY_RETRY_SLEEP_MS);
+		} else {
+			timeout = msecs_to_jiffies(VM_AVAILABILITY_RETRY_SLEEP_MS);
+			timeout = schedule_timeout_killable(timeout);
+			if (timeout) {
+				/*
+				 * The timer did not expire,
+				 * most likely because the
+				 * process was killed.
+				 */
+				return ret;
+			}
+		}
+	}
+
+	return ret;
+}
+
 static void __pkvm_destroy_hyp_vm(struct kvm *host_kvm)
 {
 	struct mm_struct *mm = current->mm;
@@ -369,7 +430,7 @@ static void __pkvm_destroy_hyp_vm(struct kvm *host_kvm)
 	unsigned long nr_busy;
 	unsigned long pages;
 	unsigned long idx;
-	int ret;
+	int ret, notify_status;
 
 	if (!pkvm_is_hyp_created(host_kvm))
 		goto out_free;
@@ -382,11 +443,9 @@ retry:
 	ppage = kvm_pinned_pages_iter_first(&host_kvm->arch.pkvm.pinned_pages, 0, ~(0UL));
 	while (ppage) {
 		struct kvm_pinned_page *next;
-		u16 pins = ppage->pins;
 
-		ret = pkvm_call_hyp_nvhe_ppage(ppage,
-						 __reclaim_dying_guest_page_call,
-						 host_kvm, true);
+		ret = pkvm_call_hyp_nvhe_ppage(ppage, __reclaim_dying_guest_page_call,
+					       host_kvm);
 		cond_resched();
 		if (ret == -EBUSY) {
 			nr_busy++;
@@ -399,18 +458,23 @@ retry:
 		unpin_user_pages_dirty_lock(&ppage->page, 1, true);
 		next = kvm_pinned_pages_iter_next(ppage, 0, ~(0UL));
 		kvm_pinned_pages_remove(ppage, &host_kvm->arch.pkvm.pinned_pages);
-		pages += pins;
+		pages += 1 << ppage->order;
 		kfree(ppage);
 		ppage = next;
 	}
 
 	account_locked_vm(mm, pages, false);
 
+	notify_status = __pkvm_notify_guest_vm_avail_retry(host_kvm, FFA_VM_DESTRUCTION_MSG);
 	if (nr_busy) {
 		do {
 			ret = kvm_call_hyp_nvhe(__pkvm_reclaim_dying_guest_ffa_resources,
 						host_kvm->arch.pkvm.handle);
 			WARN_ON(ret && ret != -EAGAIN);
+
+			if (notify_status == -EINTR || notify_status == -EAGAIN)
+				notify_status = __pkvm_notify_guest_vm_avail_retry(
+						host_kvm, FFA_VM_DESTRUCTION_MSG);
 			cond_resched();
 		} while (ret == -EAGAIN);
 		goto retry;
@@ -483,7 +547,7 @@ static int __pkvm_create_hyp_vm(struct kvm *host_kvm)
 
 	kvm_account_pgtable_pages(pgd, pgd_sz >> PAGE_SHIFT);
 
-	return 0;
+	return __pkvm_notify_guest_vm_avail_retry(host_kvm, FFA_VM_CREATION_MSG);
 free_pgd:
 	free_pages_exact(pgd, pgd_sz);
 	atomic64_sub(pgd_sz, &host_kvm->stat.protected_hyp_mem);
@@ -727,25 +791,19 @@ void pkvm_host_reclaim_page(struct kvm *host_kvm, phys_addr_t ipa)
 {
 	struct mm_struct *mm = current->mm;
 	struct kvm_pinned_page *ppage;
-	u16 pins;
+	u8 order;
 
 	write_lock(&host_kvm->mmu_lock);
 	ppage = kvm_pinned_pages_iter_first(&host_kvm->arch.pkvm.pinned_pages,
 					   ipa, ipa + PAGE_SIZE - 1);
 	if (ppage) {
-		if (ppage->pins)
-			ppage->pins--;
-		else
-			WARN_ON(1);
-
-		pins = ppage->pins;
-		if (!pins)
-			kvm_pinned_pages_remove(ppage,
-						&host_kvm->arch.pkvm.pinned_pages);
+		order = ppage->order;
+		if (!order)
+			kvm_pinned_pages_remove(ppage, &host_kvm->arch.pkvm.pinned_pages);
 	}
 	write_unlock(&host_kvm->mmu_lock);
 
-	if (WARN_ON(!ppage) || pins)
+	if (WARN_ON(!ppage || order))
 		return;
 
 	account_locked_vm(mm, 1 << ppage->order, false);
@@ -1113,27 +1171,6 @@ static struct module *pkvm_el2_mod_to_module(struct pkvm_el2_module *hyp_mod)
 	return container_of(arch, struct module, arch);
 }
 
-#ifdef CONFIG_PROTECTED_NVHE_STACKTRACE
-unsigned long pkvm_el2_mod_kern_va(unsigned long addr)
-{
-	struct pkvm_el2_module *mod;
-
-	list_for_each_entry(mod, &pkvm_modules, node) {
-		unsigned long hyp_va = (unsigned long)mod->hyp_va;
-		size_t len = (unsigned long)mod->sections.end -
-			     (unsigned long)mod->sections.start;
-
-		if (addr >= hyp_va && addr < (hyp_va + len))
-			return (unsigned long)mod->sections.start +
-				(addr - hyp_va);
-	}
-
-	return 0;
-}
-#else
-unsigned long pkvm_el2_mod_kern_va(unsigned long addr) { return 0; }
-#endif
-
 static struct pkvm_el2_module *pkvm_el2_mod_lookup_symbol(const char *name,
 							  unsigned long *addr)
 {
@@ -1364,6 +1401,78 @@ static void pkvm_module_kmemleak(struct module *this,
 	kmemleak_scan_area(start, end - start, GFP_KERNEL);
 }
 
+#define PKVM_EL2_MOD_DIRECT_RANGE	SZ_128M
+
+static unsigned long mod_direct_kern_base;
+static unsigned long mod_direct_hyp_base;
+
+unsigned long pkvm_el2_mod_kern_va(unsigned long addr)
+{
+#ifdef CONFIG_PKVM_STACKTRACE
+	struct pkvm_el2_module *mod;
+
+	/* Fast lookup into the direct range */
+	if (mod_direct_hyp_base &&
+	    addr >= mod_direct_hyp_base &&
+	    addr < mod_direct_hyp_base + PKVM_EL2_MOD_DIRECT_RANGE)
+		return mod_direct_kern_base + (addr - mod_direct_hyp_base);
+
+	list_for_each_entry(mod, &pkvm_modules, node) {
+		unsigned long hyp_va = (unsigned long)mod->hyp_va;
+		size_t len = (unsigned long)mod->sections.end -
+			     (unsigned long)mod->sections.start;
+
+		if (addr >= hyp_va && addr < (hyp_va + len))
+			return (unsigned long)mod->sections.start +
+				(addr - hyp_va);
+	}
+#endif
+	return 0;
+}
+
+static void *pkvm_el2_mod_alloc_hyp_va(size_t size)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_hvc(KVM_HOST_SMCCC_FUNC(__pkvm_alloc_module_va), size >> PAGE_SHIFT, &res);
+	if (res.a0 != SMCCC_RET_SUCCESS || !res.a1)
+		return NULL;
+
+	return (void *)res.a1;
+}
+
+static __ref void *pkvm_el2_mod_alloc_mod_direct(unsigned long start, unsigned long end)
+{
+	if (mod_direct_hyp_base)
+		goto alloc;
+
+	mod_direct_kern_base = module_direct_base ?: module_plt_base;
+	if (WARN_ON(!mod_direct_kern_base))
+		return NULL;
+
+	mod_direct_hyp_base = (unsigned long)pkvm_el2_mod_alloc_hyp_va(PKVM_EL2_MOD_DIRECT_RANGE);
+	if (!mod_direct_hyp_base) {
+		mod_direct_kern_base = 0;
+		return NULL;
+	}
+
+alloc:
+	if (start < mod_direct_kern_base ||
+	    end > mod_direct_kern_base + PKVM_EL2_MOD_DIRECT_RANGE)
+		return NULL;
+
+	return (void *)(mod_direct_hyp_base + (start - mod_direct_kern_base));
+}
+
+static void *pkvm_el2_mod_alloc_va(unsigned long start, unsigned long end)
+{
+	void *hyp_va;
+
+	hyp_va = pkvm_el2_mod_alloc_mod_direct(start, end);
+
+	return hyp_va ?: pkvm_el2_mod_alloc_hyp_va(end - start);
+}
+
 int __pkvm_load_el2_module(struct module *this, unsigned long *token)
 {
 	struct pkvm_el2_module *mod = &this->arch.hyp;
@@ -1376,7 +1485,6 @@ int __pkvm_load_el2_module(struct module *this, unsigned long *token)
 		{ &mod->data, KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W },
 	};
 	void *start, *end, *hyp_va, *mod_remap;
-	struct arm_smccc_res res;
 	kvm_nvhe_reloc_t *endrel;
 	int ret, i, secs_first;
 	size_t size;
@@ -1410,14 +1518,12 @@ int __pkvm_load_el2_module(struct module *this, unsigned long *token)
 	mod->sections.start = start;
 	mod->sections.end = end;
 
-	arm_smccc_1_1_hvc(KVM_HOST_SMCCC_FUNC(__pkvm_alloc_module_va),
-			  size >> PAGE_SHIFT, &res);
-	if (res.a0 != SMCCC_RET_SUCCESS || !res.a1) {
+	hyp_va = pkvm_el2_mod_alloc_va((unsigned long)start, (unsigned long)end);
+	if (!hyp_va) {
 		kvm_err("Failed to allocate hypervisor VA space for EL2 module\n");
 		module_put(this);
-		return res.a0 == SMCCC_RET_SUCCESS ? -ENOMEM : -EPERM;
+		return -ENOMEM;
 	}
-	hyp_va = (void *)res.a1;
 	mod->hyp_va = hyp_va;
 
 	/*
@@ -1485,7 +1591,7 @@ EXPORT_SYMBOL(__pkvm_register_el2_call);
 
 void pkvm_el2_mod_frob_sections(Elf_Ehdr *ehdr, Elf_Shdr *sechdrs, char *secstrings)
 {
-#ifdef CONFIG_PROTECTED_NVHE_FTRACE
+#ifdef CONFIG_PKVM_FTRACE
 	int i;
 
 	for (i = 0; i < ehdr->e_shnum; i++) {
@@ -1841,9 +1947,16 @@ kvm_pte_t *pkvm_pgtable_stage2_create_unlinked(struct kvm_pgtable *pgt, u64 phys
 	return NULL;
 }
 
-int pkvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size,
-			      struct kvm_mmu_memory_cache *mc)
+int pkvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size, void *mc)
 {
 	WARN_ON_ONCE(1);
 	return -EINVAL;
 }
+
+static int early_ffa_unmap_on_lend_cfg(char *arg)
+{
+	static_branch_enable(&kvm_ffa_unmap_on_lend);
+	return 0;
+}
+
+early_param("kvm-arm.ffa-unmap-on-lend", early_ffa_unmap_on_lend_cfg);

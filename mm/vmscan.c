@@ -1143,6 +1143,13 @@ retry:
 		if (!folio_trylock(folio))
 			goto keep;
 
+		if (folio_contain_hwpoisoned_page(folio)) {
+			unmap_poisoned_folio(folio, folio_pfn(folio), false);
+			folio_unlock(folio);
+			folio_put(folio);
+			continue;
+		}
+
 		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
 
 		nr_pages = folio_nr_pages(folio);
@@ -2355,6 +2362,8 @@ static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 	else
 		inactive_ratio = 1;
 
+	trace_android_vh_tune_inactive_ratio(&inactive_ratio, is_file_lru(inactive_lru));
+
 	return inactive * inactive_ratio < active;
 }
 
@@ -2378,6 +2387,7 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 {
 	unsigned long file;
 	struct lruvec *target_lruvec;
+	bool bypass = false;
 
 	if (lru_gen_enabled())
 		return;
@@ -2389,7 +2399,9 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 	 * most accurate stats here. We may switch to regular stats flushing
 	 * in the future once it is cheap enough.
 	 */
-	mem_cgroup_flush_stats_ratelimited(sc->target_mem_cgroup);
+	trace_android_vh_mem_cgroup_flush_stats_bypass(sc->target_mem_cgroup, &bypass);
+	if (!bypass)
+		mem_cgroup_flush_stats_ratelimited(sc->target_mem_cgroup);
 
 	/*
 	 * Determine the scan balance between anon and file LRUs.
@@ -7796,7 +7808,7 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 		return NODE_RECLAIM_NOSCAN;
 
 	ret = __node_reclaim(pgdat, gfp_mask, order);
-	clear_bit(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
+	clear_bit_unlock(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
 
 	if (ret)
 		count_vm_event(PGSCAN_ZONE_RECLAIM_SUCCESS);

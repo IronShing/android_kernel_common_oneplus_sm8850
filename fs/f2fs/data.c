@@ -59,8 +59,8 @@ bool f2fs_is_cp_guaranteed(struct page *page)
 	struct inode *inode;
 	struct f2fs_sb_info *sbi;
 
-	if (!mapping)
-		return false;
+	if (fscrypt_is_bounce_page(page))
+		return page_private_gcing(fscrypt_pagecache_page(page));
 
 	inode = mapping->host;
 	sbi = F2FS_I_SB(inode);
@@ -924,7 +924,7 @@ alloc_new:
 	if (fio->io_wbc)
 		wbc_account_cgroup_owner(fio->io_wbc, folio, folio_size(folio));
 
-	inc_page_count(fio->sbi, WB_DATA_TYPE(page, false));
+	inc_page_count(fio->sbi, WB_DATA_TYPE(fio->page, false));
 
 	*fio->last_block = fio->new_blkaddr;
 	*fio->bio = bio;
@@ -2128,7 +2128,7 @@ got_it:
 		block_nr = map->m_pblk + block_in_file - map->m_lblk;
 		folio_set_mappedtodisk(folio);
 
-		if (!!folio_test_uptodate(folio) && (!folio_test_swapcache(folio) &&
+		if (!folio_test_uptodate(folio) && (!folio_test_swapcache(folio) &&
 					!cleancache_get_page(&folio->page))) {
 			folio_mark_uptodate(folio);
 			goto confused;
@@ -3994,7 +3994,7 @@ retry:
 
 		if ((pblock - SM_I(sbi)->main_blkaddr) % blks_per_sec ||
 				nr_pblocks % blks_per_sec ||
-				!f2fs_valid_pinned_area(sbi, pblock)) {
+				f2fs_is_sequential_zone_area(sbi, pblock)) {
 			bool last_extent = false;
 
 			not_aligned++;

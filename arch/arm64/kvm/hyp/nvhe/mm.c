@@ -111,7 +111,7 @@ int __pkvm_create_private_mapping(phys_addr_t phys, size_t size,
 	return err;
 }
 
-#ifdef CONFIG_NVHE_EL2_DEBUG
+#ifdef CONFIG_PKVM_STRICT_CHECKS
 static unsigned long mod_range_start = ULONG_MAX;
 static unsigned long mod_range_end;
 static DEFINE_HYP_SPINLOCK(mod_range_lock);
@@ -364,7 +364,7 @@ static void fixmap_clear_slot(struct hyp_fixmap_slot *slot)
 	 */
 	dsb(ishst);
 	__tlbi_level(vale2is, __TLBI_VADDR(addr, 0), level);
-	dsb(ish);
+	__tlbi_sync_s1ish_hyp();
 	isb();
 }
 

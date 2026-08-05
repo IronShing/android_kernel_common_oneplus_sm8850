@@ -172,14 +172,37 @@ static void handle_pvm_entry_psci(struct pkvm_hyp_vcpu *hyp_vcpu)
 			unsigned long cpu_id = smccc_get_arg1(&hyp_vcpu->vcpu);
 			struct pkvm_hyp_vcpu *target_vcpu;
 			struct pkvm_hyp_vm *hyp_vm;
+			int prev;
 
 			hyp_vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 			target_vcpu = pkvm_mpidr_to_hyp_vcpu(hyp_vm, cpu_id);
 
-			if (target_vcpu && READ_ONCE(target_vcpu->power_state) == PSCI_0_2_AFFINITY_LEVEL_ON_PENDING)
-				WRITE_ONCE(target_vcpu->power_state, PSCI_0_2_AFFINITY_LEVEL_OFF);
+			/*
+			 * pvm_psci_vcpu_on() resolved this MPIDR before
+			 * forwarding and vcpus[] entries are never removed,
+			 * so a NULL here is an EL2-internal invariant
+			 * violation, not host-reachable.
+			 */
+			WARN_ON(!target_vcpu);
 
-			ret = PSCI_RET_INTERNAL_FAILURE;
+			prev = cmpxchg_relaxed(&target_vcpu->power_state,
+					       PSCI_0_2_AFFINITY_LEVEL_ON_PENDING,
+					       PSCI_0_2_AFFINITY_LEVEL_OFF);
+			/*
+			 * Rollback win (prior == ON_PENDING): target never ran.
+			 * Clear reset_state->reset so a future smp_load_acquire
+			 * doesn't pair with this cancelled cycle's release, and
+			 * report INTERNAL_FAILURE. Otherwise the target's reset
+			 * advanced past ON_PENDING (possibly on to OFF via its
+			 * own CPU_OFF), so per PSCI the guest sees SUCCESS.
+			 */
+			if (prev == PSCI_0_2_AFFINITY_LEVEL_ON_PENDING) {
+				WRITE_ONCE(target_vcpu->vcpu.arch.reset_state.reset,
+					   false);
+				ret = PSCI_RET_INTERNAL_FAILURE;
+			} else {
+				ret = PSCI_RET_SUCCESS;
+			}
 		}
 
 		break;
@@ -1026,11 +1049,16 @@ static void handle___kvm_vcpu_run(struct kvm_cpu_context *host_ctxt)
 		if (unlikely(system_supports_sme() && read_sysreg_s(SYS_SVCR)))
 			goto out;
 
-		if (hyp_vcpu->power_state == PSCI_0_2_AFFINITY_LEVEL_ON_PENDING)
-			pkvm_reset_vcpu(hyp_vcpu);
-
-		if (unlikely(hyp_vcpu->power_state != PSCI_0_2_AFFINITY_LEVEL_ON))
+		switch (READ_ONCE(hyp_vcpu->power_state)) {
+		case PSCI_0_2_AFFINITY_LEVEL_ON:
+			break;
+		case PSCI_0_2_AFFINITY_LEVEL_ON_PENDING:
+			if (pkvm_reset_vcpu(hyp_vcpu))
+				goto out;
+			break;
+		default:
 			goto out;
+		}
 
 		flush_hyp_vcpu(hyp_vcpu);
 		ret = __kvm_vcpu_run(&hyp_vcpu->vcpu);
@@ -1215,6 +1243,29 @@ static void handle___pkvm_host_mkyoung_guest(struct kvm_cpu_context *host_ctxt)
 	pte = __pkvm_host_mkyoung_guest(gfn, hyp_vcpu);
 out:
 	cpu_reg(host_ctxt, 1) =  pte;
+}
+
+static void handle___pkvm_host_split_guest(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(u64, gfn, host_ctxt, 1);
+	DECLARE_REG(u64, size, host_ctxt, 2);
+	struct pkvm_hyp_vcpu *hyp_vcpu;
+	int ret = -EINVAL;
+
+	if (!is_protected_kvm_enabled())
+		goto out;
+
+	hyp_vcpu = pkvm_get_loaded_hyp_vcpu();
+	if (!hyp_vcpu)
+		goto out;
+
+	if (!pkvm_hyp_vcpu_is_protected(hyp_vcpu))
+		goto out;
+
+	ret = __pkvm_host_split_guest(gfn, size, hyp_vcpu);
+
+out:
+	cpu_reg(host_ctxt, 1) = ret;
 }
 
 static void handle___kvm_adjust_pc(struct kvm_cpu_context *host_ctxt)
@@ -1446,6 +1497,13 @@ static void handle___pkvm_reclaim_dying_guest_ffa_resources(struct kvm_cpu_conte
 	cpu_reg(host_ctxt, 1) = __pkvm_reclaim_dying_guest_ffa_resources(handle);
 }
 
+static void handle___pkvm_notify_guest_vm_avail(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(pkvm_handle_t, handle, host_ctxt, 1);
+
+	cpu_reg(host_ctxt, 1) = __pkvm_notify_guest_vm_avail(handle);
+}
+
 static void handle___pkvm_create_private_mapping(struct kvm_cpu_context *host_ctxt)
 {
 	DECLARE_REG(phys_addr_t, phys, host_ctxt, 1);
@@ -1571,7 +1629,7 @@ static void handle___pkvm_selftest_event(struct kvm_cpu_context *host_ctxt)
 {
 	int smc_ret = SMCCC_RET_NOT_SUPPORTED, ret = -EOPNOTSUPP;
 
-#ifdef CONFIG_PROTECTED_NVHE_TESTING
+#ifdef CONFIG_PKVM_SELFTESTS
 	trace_selftest();
 	smc_ret = SMCCC_RET_SUCCESS;
 	ret = 0;
@@ -1912,6 +1970,7 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_host_wrprotect_guest),
 	HANDLE_FUNC(__pkvm_host_test_clear_young_guest),
 	HANDLE_FUNC(__pkvm_host_mkyoung_guest),
+	HANDLE_FUNC(__pkvm_host_split_guest),
 	HANDLE_FUNC(__kvm_adjust_pc),
 	HANDLE_FUNC(__kvm_vcpu_run),
 	HANDLE_FUNC(__kvm_timer_set_cntvoff),
@@ -1923,6 +1982,7 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_finalize_teardown_vm),
 	HANDLE_FUNC(__pkvm_reclaim_dying_guest_page),
 	HANDLE_FUNC(__pkvm_reclaim_dying_guest_ffa_resources),
+	HANDLE_FUNC(__pkvm_notify_guest_vm_avail),
 	HANDLE_FUNC(__pkvm_vcpu_load),
 	HANDLE_FUNC(__pkvm_vcpu_put),
 	HANDLE_FUNC(__pkvm_vcpu_sync_state),
